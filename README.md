@@ -1,3 +1,6 @@
+Assembler-for-an-Abstract-Machine
+x86 32-bit compatible
+
 compile:
 g++ -std=c++17 -O2 -Wall -Wextra -o assembler main.cpp worklet2.cpp
 
