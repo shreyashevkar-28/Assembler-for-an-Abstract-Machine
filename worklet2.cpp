@@ -367,3 +367,133 @@ Status encodeOne(const Instruction& in, std::vector<uint8_t>& out,
         default:
             break;                                          // ALU group below
     }
+
+     uint8_t rmR, rRm, ext;
+    if (!aluForm(in.op, rmR, rRm, ext)) return Status::BAD_OPCODE;
+    if (n != 2) return Status::BAD_OPERANDS;
+
+    if (isRM(a) && isImm(b)) {
+        const bool short8 = fitsInt8(b.imm);
+        // op EAX, imm32  (opcode+4, no ModRM) -- the 5-byte short form that
+        // Worklet 1's Pass 1 assumes whenever the immediate doesn't fit in 8 bits.
+        if (!short8 && isReg(a) && a.reg == Reg::EAX) {
+            put8(out, rmR + 4u);
+            put32(out, static_cast<uint32_t>(b.imm));
+            return Status::OK;
+        }
+        put8(out, short8 ? 0x83u : 0x81u);                  // 83 /d ib  or  81 /d id
+        Status s = emitModRM(out, ext, a, fixups, idx);
+        if (s != Status::OK) return s;
+        if (short8) put8(out, static_cast<uint32_t>(b.imm));
+        else        put32(out, static_cast<uint32_t>(b.imm));
+        return Status::OK;
+    }
+    if (isReg(a) && isRM(b)) {                              // op r32, r/m32   /r
+        put8(out, rRm);
+        return emitModRM(out, code(a.reg), b, fixups, idx);
+    }
+    if (isMem(a) && isReg(b)) {                             // op r/m32, r32   /r
+        put8(out, rmR);
+        return emitModRM(out, code(b.reg), a, fixups, idx);
+    }
+    return Status::BAD_OPERANDS;
+}
+
+Result fail(Status s, size_t idx) {
+    Result r = { s, idx };
+    return r;
+}
+
+Result encodeImpl(const Program& prog, std::vector<uint8_t>& out,
+                  std::vector<size_t>* offs) {
+    out.reserve(prog.count * 8);
+    if (offs) offs->reserve(prog.count + 1);
+
+    std::vector<size_t> labelOffset(prog.labelCount, kUndefined);   // O(1) lookup by label ID
+    std::vector<Fixup>  fixups;
+
+    // Single pass: emit bytes, record where each label lands.
+    for (size_t i = 0; i < prog.count; ++i) {
+        const Instruction& in = prog.instrs[i];
+
+        if (in.defLabel != NO_LABEL) {
+            if (in.defLabel >= prog.labelCount)          return fail(Status::LABEL_OUT_OF_RANGE, i);
+            if (labelOffset[in.defLabel] != kUndefined)  return fail(Status::DUPLICATE_LABEL, i);
+            labelOffset[in.defLabel] = out.size();
+        }
+        if (offs) offs->push_back(out.size());
+
+        Status s = encodeOne(in, out, fixups, i);
+        if (s != Status::OK) return fail(s, i);
+    }
+    if (offs) offs->push_back(out.size());                  // total size
+
+    // A label that sits after the last instruction.
+    if (prog.endLabel != NO_LABEL) {
+        if (prog.endLabel >= prog.labelCount)            return fail(Status::LABEL_OUT_OF_RANGE, prog.count);
+        if (labelOffset[prog.endLabel] != kUndefined)    return fail(Status::DUPLICATE_LABEL, prog.count);
+        labelOffset[prog.endLabel] = out.size();
+    }
+
+    // Back-patch label references.
+    //   relative: rel32 = target - (address of the byte after the rel32 field)
+    //   absolute: baseAddress + target
+    for (size_t k = 0; k < fixups.size(); ++k) {
+        const Fixup& f = fixups[k];
+        if (f.label >= prog.labelCount)        return fail(Status::LABEL_OUT_OF_RANGE, f.instr);
+        const size_t target = labelOffset[f.label];
+        if (target == kUndefined)              return fail(Status::UNDEFINED_LABEL, f.instr);
+
+        uint32_t v;
+        if (f.absolute) {
+            v = prog.baseAddress + static_cast<uint32_t>(target);
+        } else {
+            const int64_t rel = static_cast<int64_t>(target) - static_cast<int64_t>(f.pos + 4);
+            v = static_cast<uint32_t>(rel);                 // two's-complement wrap is intended
+        }
+        patch32(out, f.pos, v);
+    }
+
+    return fail(Status::OK, 0);
+}
+
+} // namespace
+
+const char* statusText(Status s) {
+    switch (s) {
+        case Status::OK:                 return "OK";
+        case Status::BAD_OPCODE:         return "opcode not handled";
+        case Status::BAD_OPERANDS:       return "wrong operand count or unsupported operand combination";
+        case Status::BAD_SCALE:          return "memory scale must be 1, 2, 4 or 8";
+        case Status::BAD_INDEX_REG:      return "ESP cannot be an index register";
+        case Status::LABEL_OUT_OF_RANGE: return "label ID out of range";
+        case Status::DUPLICATE_LABEL:    return "label defined twice";
+        case Status::UNDEFINED_LABEL:    return "label referenced but never defined";
+        case Status::BAD_IMMEDIATE:      return "immediate out of range for this instruction";
+    }
+    return "unknown status";
+}
+
+Result encode(const Program& prog, std::vector<uint8_t>& out, std::vector<size_t>* instrOffsets) {
+    out.clear();
+    if (instrOffsets) instrOffsets->clear();
+
+    Result r = encodeImpl(prog, out, instrOffsets);
+    if (r.status != Status::OK) {
+        out.clear();
+        if (instrOffsets) instrOffsets->clear();
+    }
+    return r;
+}
+
+bool writeBinFile(const char* path, const std::vector<uint8_t>& bytes) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    if (!bytes.empty()) {
+        f.write(reinterpret_cast<const char*>(&bytes[0]), static_cast<std::streamsize>(bytes.size()));
+    }
+    f.close();
+    return !f.fail();
+}
+
+} 
